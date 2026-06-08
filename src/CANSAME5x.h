@@ -18,6 +18,14 @@ public:
 
   int endPacket() final;
 
+  // Non-blocking TX. These push the frame to the hardware TX FIFO and return
+  // immediately, instead of busy-waiting for transmission like endPacket() did.
+  int sendFrame(uint32_t id, const uint8_t *data, uint8_t dlc,
+                bool extended = false, bool rtr = false);
+  int endPacketAsync();
+  bool txFifoFull();
+  uint8_t txFifoPending();
+
   int parsePacket() final;
 
   void onReceive(void (*callback)(int)) final;
@@ -36,6 +44,12 @@ public:
 
 private:
   void bus_autorecover();
+
+  // Stage one frame at the TX FIFO put index and request transmission.
+  // Non-blocking. Returns the put index used (>= 0) or -1 if the frame was
+  // dropped (FIFO full / controller in INIT/bus-off).
+  int _pushTxFifo(uint32_t id, bool extended, bool rtr, const uint8_t *data,
+                  uint8_t dlc);
 
   void handleInterrupt();
 

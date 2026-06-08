@@ -31,7 +31,17 @@ namespace {
 
 #define GCLK_CAN1 GCLK_PCHCTRL_GEN_GCLK1_Val
 #define GCLK_CAN0 GCLK_PCHCTRL_GEN_GCLK1_Val
-#define ADAFRUIT_ZEROCAN_TX_BUFFER_SIZE (1)
+// TX FIFO depth (MCAN Tx FIFO elements). Non-blocking sends queue here and the
+// hardware drains them in submission order (TFQM=0). Override with a build flag
+// if you want a shallower FIFO; defaults to the MCAN maximum of 32. Each
+// element costs about 16 bytes of message RAM.
+#ifndef ADAFRUIT_ZEROCAN_TX_FIFO_SIZE
+#define ADAFRUIT_ZEROCAN_TX_FIFO_SIZE (32)
+#endif
+#if (ADAFRUIT_ZEROCAN_TX_FIFO_SIZE < 1) || (ADAFRUIT_ZEROCAN_TX_FIFO_SIZE > 32)
+#error                                                                         \
+    "ADAFRUIT_ZEROCAN_TX_FIFO_SIZE must be in 1..32 (MCAN total TX element cap)"
+#endif
 #define ADAFRUIT_ZEROCAN_RX_FILTER_SIZE (1)
 #define ADAFRUIT_ZEROCAN_RX_FIFO_SIZE (8)
 #define ADAFRUIT_ZEROCAN_MAX_MESSAGE_LENGTH (8)
@@ -96,9 +106,12 @@ struct _canSAME5x_rx_fifo {
   CAN_RXF0E_1_Type rxf1;
   __attribute((aligned(4))) uint8_t data[ADAFRUIT_ZEROCAN_MAX_MESSAGE_LENGTH];
 } can_rx_fifo_t;
+// Reference the type once so -Wunused-variable stays quiet under -Werror
+// builds.
+static inline void _suppress_unused_rx_fifo() { (void)sizeof(can_rx_fifo_t); }
 
 struct _canSAME5x_state {
-  _canSAME5x_tx_buf tx_buffer[ADAFRUIT_ZEROCAN_TX_BUFFER_SIZE];
+  _canSAME5x_tx_buf tx_buffer[ADAFRUIT_ZEROCAN_TX_FIFO_SIZE];
   _canSAME5x_rx_fifo rx_fifo[ADAFRUIT_ZEROCAN_RX_FIFO_SIZE];
   CanMramSidfe standard_rx_filter[ADAFRUIT_ZEROCAN_RX_FILTER_SIZE];
   CanMramXifde extended_rx_filter[ADAFRUIT_ZEROCAN_RX_FILTER_SIZE];
@@ -128,7 +141,7 @@ bool compute_nbtp(uint32_t baudrate, CAN_NBTP_Type &result) {
 
 EPioType find_pin(const can_function *table, size_t n, int arduino_pin,
                   int &instance) {
-  if (arduino_pin < 0 || arduino_pin > PINS_COUNT) {
+  if (arduino_pin < 0 || arduino_pin >= (int)PINS_COUNT) {
     return (EPioType)-1;
   }
 
@@ -218,7 +231,7 @@ int CANSAME5x::begin(long baudrate) {
   _hw = reinterpret_cast<void *>(_idx == 0 ? CAN0 : CAN1);
   _state = reinterpret_cast<void *>(&can_state[_idx]);
 
-  memset(state, 0, sizeof(*state));
+  memset((void *)state, 0, sizeof(*state)); // NOLINT: trivial POD-like struct
 
   pinPeripheral(_tx, tx_function);
   pinPeripheral(_rx, rx_function);
@@ -241,12 +254,17 @@ int CANSAME5x::begin(long baudrate) {
     hw->TXESC.reg = esc.reg;
   }
 
-  // Set up TX buffer
+  // Set up TX FIFO (not a dedicated buffer). Non-blocking sends push to the
+  // FIFO put index and the hardware transmits in submission order. NDTB=0 (no
+  // dedicated buffers), TFQS=depth, TFQM=0 (FIFO order, not Queue/priority
+  // mode).
   {
     CAN_TXBC_Type bc = {};
     bc.bit.TBSA = (uint32_t)state->tx_buffer;
-    bc.bit.NDTB = ADAFRUIT_ZEROCAN_TX_BUFFER_SIZE;
-    bc.bit.TFQM = 0; // Messages are transmitted in the order submitted
+    bc.bit.NDTB = 0;
+    bc.bit.TFQS = ADAFRUIT_ZEROCAN_TX_FIFO_SIZE;
+    bc.bit.TFQM =
+        0; // 0 = FIFO mode: messages transmitted in the order submitted
     hw->TXBC.reg = bc.reg;
   }
 
@@ -341,46 +359,102 @@ void CANSAME5x::end() {
   }
 }
 
-int CANSAME5x::endPacket() {
-  if (!CANControllerClass::endPacket()) {
-    return 0;
+// Push one frame into the TX FIFO. Non-blocking: stages the frame at the
+// hardware put index and sets the matching TXBAR add-request bit, then returns.
+// The hardware transmits asynchronously in FIFO order. Returns the put index
+// used (>= 0) or -1 if the frame could not be accepted (FIFO full, or the
+// controller is in INIT/bus-off and would silently ignore the request). NEVER
+// waits for transmission to occur.
+int CANSAME5x::_pushTxFifo(uint32_t id, bool extended, bool rtr,
+                           const uint8_t *data, uint8_t dlc) {
+  // Refuse if the controller can't transmit right now. During INIT (set on
+  // bus-off and before begin() completes) a TXBAR write is ignored by the
+  // hardware, so accepting the frame here would silently drop it. Return -1
+  // instead and let the caller recover the bus and retry.
+  if (hw->CCCR.bit.INIT) {
+    return -1;
+  }
+  // FIFO full: drop and let the caller account for it. This is the load-shed
+  // path when the bus can't drain, and the only place a healthy system drops a
+  // frame.
+  if (hw->TXFQS.bit.TFQF) {
+    return -1;
   }
 
-  bus_autorecover();
+  if (dlc > 8) {
+    dlc = 8;
+  }
 
-  // TODO wait for TX buffer to free
-
-  _canSAME5x_tx_buf &buf = state->tx_buffer[0];
+  const uint32_t idx = hw->TXFQS.bit.TFQPI; // hardware-assigned put index
+  _canSAME5x_tx_buf &buf = state->tx_buffer[idx];
   buf.txb0.bit.ESI = false;
-  buf.txb0.bit.XTD = _txExtended;
-  buf.txb0.bit.RTR = _txRtr;
-  if (_txExtended) {
-    buf.txb0.bit.ID = _txId;
+  buf.txb0.bit.XTD = extended;
+  buf.txb0.bit.RTR = rtr;
+  if (extended) {
+    buf.txb0.bit.ID = id;
   } else {
-    buf.txb0.bit.ID = _txId << 18;
+    buf.txb0.bit.ID = id << 18;
   }
   buf.txb1.bit.MM = 0;
   buf.txb1.bit.EFC = 0;
   buf.txb1.bit.FDF = 0;
   buf.txb1.bit.BRS = 0;
-  buf.txb1.bit.DLC = _txLength;
-
-  if (!_txRtr) {
-    memcpy(buf.data, _txData, _txLength);
-  }
-
-  // TX buffer add request
-  hw->TXBAR.reg = 1;
-
-  // wait 8ms (hard coded for now) for TX to occur
-  for (int i = 0; i < 8000; i++) {
-    if (hw->TXBTO.reg & 1) {
-      return true;
+  buf.txb1.bit.DLC = dlc;
+  // TX FIFO slots are reused across sends; a data frame must overwrite the
+  // whole payload so a null-data send can't transmit a previous frame's stale
+  // bytes.
+  if (!rtr) {
+    if (data != nullptr) {
+      memcpy(buf.data, data, dlc);
+    } else if (dlc > 0) {
+      memset(buf.data, 0, dlc);
     }
-    yield();
   }
 
-  return 1;
+  // Request transmission of exactly this element. TXBAR is write-1-to-set, so
+  // write a fresh single-bit mask rather than a read-modify-write (an RMW could
+  // re-request an element that is already draining).
+  hw->TXBAR.reg = (1u << idx);
+  return (int)idx;
+}
+
+// Whole-frame non-blocking send (see issue #8). Fills and queues a frame in one
+// call so callers don't need the beginPacket()/write()/endPacket() dance.
+// Returns 1 if queued, 0 if dropped (FIFO full or controller not ready).
+int CANSAME5x::sendFrame(uint32_t id, const uint8_t *data, uint8_t dlc,
+                         bool extended, bool rtr) {
+  return _pushTxFifo(id, extended, rtr, data, dlc) >= 0 ? 1 : 0;
+}
+
+// Non-blocking drop-in for the byte-at-a-time beginPacket()/write()/endPacket()
+// flow. Validates the staged frame, then pushes it to the FIFO without waiting.
+// Returns 1 if queued, 0 if dropped.
+int CANSAME5x::endPacketAsync() {
+  if (!CANControllerClass::endPacket()) {
+    return 0;
+  }
+  return _pushTxFifo(_txId, _txExtended, _txRtr, _txData, _txLength) >= 0 ? 1
+                                                                          : 0;
+}
+
+// The old endPacket() busy-waited up to ~8 ms for the frame to transmit,
+// polling TXBTO with yield() in the loop. On a marginal bus that never ACKs,
+// that stalled the caller for the full timeout on every send. Under FIFO mode
+// there's no single dedicated buffer left to poll, so endPacket() now just
+// delegates to the non-blocking path. Kept for API compatibility; new code
+// should prefer sendFrame() or endPacketAsync().
+int CANSAME5x::endPacket() { return endPacketAsync(); }
+
+// True when the TX FIFO has no free element (next send would drop).
+bool CANSAME5x::txFifoFull() { return hw->TXFQS.bit.TFQF; }
+
+// Number of frames queued in the TX FIFO but not yet transmitted. TXFQS.TFFL is
+// the "Tx FIFO Free Level" from the SAME51 datasheet (count of FREE elements,
+// 0..TFQS), so pending = configured depth - free. Empty FIFO gives TFFL==depth
+// (pending 0); full FIFO gives TFFL==0 (pending==depth). Handy before end() to
+// know how many frames a reset would discard.
+uint8_t CANSAME5x::txFifoPending() {
+  return (uint8_t)(ADAFRUIT_ZEROCAN_TX_FIFO_SIZE - hw->TXFQS.bit.TFFL);
 }
 
 int CANSAME5x::_parsePacket() {
@@ -536,13 +610,20 @@ void CANSAME5x::bus_autorecover() {
   if (hw->PSR.bit.BO) {
     DEBUG_PRINTLN("bus autorecovery activated");
     hw->CCCR.bit.INIT = 0;
-    while (hw->CCCR.bit.INIT) {
+    // Bounded wait. The original while (INIT) {} spins forever if the bus stays
+    // down (no recessive bits to clock INIT back to 0), which hangs the whole
+    // sketch. 1000 iterations is roughly 10us at 120MHz, well under any
+    // reasonable watchdog. If it's still set the bus is down; the caller can
+    // retry recovery later instead of blocking here.
+    for (int i = 0; i < 1000; i++) {
+      if (!hw->CCCR.bit.INIT)
+        return;
     }
   }
 }
 
 void CANSAME5x::onInterrupt() {
-  for (int i = 0; i < size(instances); i++) {
+  for (size_t i = 0; i < size(instances); i++) {
     CANSAME5x *instance = instances[i];
     if (instance) {
       instance->handleInterrupt();
